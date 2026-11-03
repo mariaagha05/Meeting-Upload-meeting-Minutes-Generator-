@@ -65,14 +65,12 @@ TEXT_EXT = {"txt", "md", "docx", "pdf"}
 MAX_AUDIO_MB = 25  # Groq free-tier upload limit
 CHUNK_CHARS = 16000  # keeps each LLM request small and fast
 
-LLM_MODELS = {
-    "Llama 3.3 70B (best quality)": "llama-3.3-70b-versatile",
-    "Llama 3.1 8B (fastest)": "llama-3.1-8b-instant",
-}
-WHISPER_MODELS = {
-    "Whisper Large v3 Turbo (fast)": "whisper-large-v3-turbo",
-    "Whisper Large v3 (most accurate)": "whisper-large-v3",
-}
+# Fallback lists, used only if the live model list cannot be loaded.
+FALLBACK_CHAT = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+FALLBACK_AUDIO = ["whisper-large-v3-turbo", "whisper-large-v3"]
+CHAT_PREFERENCE = ["llama-3.3-70b", "gpt-oss-120b", "llama-4-maverick", "llama-4-scout", "gpt-oss-20b", "llama-3.1-8b", "qwen"]
+AUDIO_PREFERENCE = ["turbo", "large-v3"]
+SKIP_FOR_CHAT = ("whisper", "tts", "guard", "orpheus", "playai", "compound", "embed", "safeguard", "allam")
 LANGUAGES = {
     "Auto-detect": None,
     "English": "en",
@@ -85,6 +83,18 @@ LANGUAGES = {
 }
 PRIORITIES = ["High", "Medium", "Low"]
 STATUSES = ["Open", "In progress", "Done"]
+
+
+# ---------------------------------------------------------------------------
+# BACKEND CONFIG  (users never see this)
+# Put your Groq key in ONE of these places (checked in this order):
+#   1) .streamlit/secrets.toml  ->  GROQ_API_KEY = "gsk_..."
+#   2) environment variable      ->  GROQ_API_KEY
+#   3) the constant below
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = ""          # optional: paste "gsk_..." here
+LLM_MODEL_OVERRIDE = ""    # optional: force one summary model id
+WHISPER_MODEL_OVERRIDE = ""  # optional: force one transcription model id
 
 
 class AppError(Exception):
@@ -200,17 +210,17 @@ st.markdown(CSS, unsafe_allow_html=True)
 def get_default_key() -> str:
     try:
         if "GROQ_API_KEY" in st.secrets:
-            return str(st.secrets["GROQ_API_KEY"])
+            return str(st.secrets["GROQ_API_KEY"]).strip()
     except Exception:
         pass
-    return os.environ.get("GROQ_API_KEY", "")
+    return (os.environ.get("GROQ_API_KEY", "") or GROQ_API_KEY).strip()
 
 
 def get_client(api_key: str):
     if Groq is None:
         raise AppError("The 'groq' package is not installed. Run: pip install -r requirements.txt")
     if not api_key or not api_key.strip():
-        raise AppError("Please paste your Groq API key in the sidebar first.")
+        raise AppError("The AI service is not configured yet. The site owner must add the Groq API key in the backend (secrets.toml, environment variable or app.py).")
     return Groq(api_key=api_key.strip())
 
 
@@ -222,16 +232,56 @@ def explain_error(exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
     if name == "AuthenticationError" or "invalid api key" in low or "401" in low:
-        return "Your Groq API key was rejected. Check the key in the sidebar (it should start with 'gsk_')."
+        return "The AI service key was rejected. The site owner must check the Groq API key in the backend (it should start with 'gsk_')."
     if name == "RateLimitError" or "rate limit" in low or "429" in low:
         return "Groq's rate limit was reached. Wait about a minute and try again, or choose the faster 8B model."
     if name in ("APIConnectionError", "APITimeoutError") or "connection" in low or "timed out" in low:
         return "Could not reach Groq. Check your internet connection and try again."
     if "model" in low and ("not found" in low or "decommissioned" in low or "does not exist" in low):
-        return "The selected model is not available on your Groq account. Pick another model in the sidebar."
+        return "None of the configured AI models are available on this Groq account. The site owner must update the model settings in the backend."
     if "413" in low or "too large" in low or "request entity" in low:
         return "The file or text is too large for Groq. Try a shorter recording or smaller document."
     return f"Something went wrong: {text[:300]}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_models(api_key: str):
+    """Ask Groq which models this key can use right now."""
+    client = Groq(api_key=api_key.strip())
+    resp = client.models.list()
+    items = getattr(resp, "data", None)
+    if items is None and isinstance(resp, dict):
+        items = resp.get("data", [])
+    ids = []
+    for it in items or []:
+        mid = getattr(it, "id", None) or (it.get("id") if isinstance(it, dict) else None)
+        active = getattr(it, "active", True)
+        if mid and active is not False:
+            ids.append(mid)
+    return sorted(set(ids))
+
+
+def _rank(model_id: str, prefs) -> int:
+    for i, p in enumerate(prefs):
+        if p in model_id.lower():
+            return i
+    return 99
+
+
+def split_models(ids):
+    audio = sorted([i for i in ids if "whisper" in i.lower()], key=lambda m: _rank(m, AUDIO_PREFERENCE))
+    chat = sorted(
+        [i for i in ids if not any(k in i.lower() for k in SKIP_FOR_CHAT)],
+        key=lambda m: _rank(m, CHAT_PREFERENCE),
+    )
+    return chat, audio
+
+
+def is_model_error(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "model" in low and any(
+        k in low for k in ("not found", "decommission", "does not exist", "no access", "not supported", "deprecated", "unavailable")
+    )
 
 
 def read_text_file(name: str, data: bytes) -> str:
@@ -276,15 +326,21 @@ def transcribe_audio(client, name: str, data: bytes, model: str, language) -> st
             f"This recording is {size_mb:.1f} MB. Groq accepts up to {MAX_AUDIO_MB} MB per file. "
             "Compress it (e.g. export as a mono 64 kbps MP3) or split it into parts."
         )
-    kwargs = {
-        "file": (name, data),
-        "model": model,
-        "response_format": "verbose_json",
-        "temperature": 0.0,
-    }
-    if language:
-        kwargs["language"] = language
-    resp = client.audio.transcriptions.create(**kwargs)
+    models = [model] if isinstance(model, str) else list(model)
+    resp, last_exc = None, None
+    for m_id in models:
+        kwargs = {"file": (name, data), "model": m_id, "response_format": "verbose_json", "temperature": 0.0}
+        if language:
+            kwargs["language"] = language
+        try:
+            resp = client.audio.transcriptions.create(**kwargs)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if not is_model_error(exc):
+                raise
+    if resp is None:
+        raise last_exc if last_exc else AppError("No transcription model is available on your account.")
     text = getattr(resp, "text", None)
     if text is None and isinstance(resp, dict):
         text = resp.get("text")
@@ -342,7 +398,7 @@ def split_chunks(text: str, size: int = CHUNK_CHARS):
 
 
 def parse_json(raw: str) -> dict:
-    raw = (raw or "").strip()
+    raw = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL).strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     try:
         return json.loads(raw)
@@ -356,29 +412,42 @@ def parse_json(raw: str) -> dict:
     raise AppError("The AI returned an unreadable answer. Please click Generate again.")
 
 
-def call_llm(client, model: str, user_prompt: str) -> dict:
+def call_llm(client, models, user_prompt: str) -> dict:
+    """Try each candidate model in turn; skips models that are unavailable."""
+    if isinstance(models, str):
+        models = [models]
     last_exc = None
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-                max_tokens=3000,
-                response_format={"type": "json_object"},
-            )
-            return parse_json(resp.choices[0].message.content)
-        except AppError as exc:  # bad JSON -> retry once or twice
-            last_exc = exc
-        except Exception as exc:
-            last_exc = exc
-            if "rate" in str(exc).lower() or "429" in str(exc):
-                time.sleep(6 * (attempt + 1))
-            elif attempt == 2:
-                raise
+    for model in models:
+        use_json_mode = True
+        for attempt in range(3):
+            try:
+                kwargs = dict(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=5000,
+                )
+                if use_json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = client.chat.completions.create(**kwargs)
+                return parse_json(resp.choices[0].message.content)
+            except AppError as exc:  # unreadable JSON -> retry
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+                low = str(exc).lower()
+                if is_model_error(exc):
+                    break  # go to the next candidate model
+                if use_json_mode and ("response_format" in low or "json" in low):
+                    use_json_mode = False
+                    continue
+                if "rate" in low or "429" in low:
+                    time.sleep(6 * (attempt + 1))
+                elif attempt == 2:
+                    raise
     raise last_exc if last_exc else AppError("Unknown AI error.")
 
 
@@ -542,7 +611,7 @@ for key, default in {"minutes": None, "transcript": "", "gen": 0, "meeting_date"
         st.session_state[key] = default
 
 
-def run_pipeline(client, llm_model, text, meeting_date):
+def run_pipeline(client, llm_models, text, meeting_date):
     """Extract minutes from text and store them in session state."""
     with st.spinner("Extracting summary, decisions and action items..."):
         data = extract_minutes(client, llm_model, text, meeting_date)
@@ -556,16 +625,7 @@ def run_pipeline(client, llm_model, text, meeting_date):
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("## Settings")
-    api_key = st.text_input(
-        "Groq API key",
-        value=get_default_key(),
-        type="password",
-        placeholder="gsk_...",
-        help="Get a free key at console.groq.com. It is used only for this session and is never saved.",
-    )
-    llm_label = st.selectbox("Summary model", list(LLM_MODELS.keys()))
-    whisper_label = st.selectbox("Transcription model", list(WHISPER_MODELS.keys()))
+    st.markdown("## Options")
     lang_label = st.selectbox("Recording language", list(LANGUAGES.keys()))
     meeting_date_in = st.date_input("Meeting date", value=date.today(), help="Used to turn 'by Friday' into a real date.")
     st.markdown("---")
@@ -583,8 +643,20 @@ with st.sidebar:
         st.session_state.gen += 1
         st.rerun()
 
-llm_model = LLM_MODELS[llm_label]
-whisper_model = WHISPER_MODELS[whisper_label]
+api_key = get_default_key()
+_live_ids = []
+if Groq is not None and api_key:
+    try:
+        _live_ids = fetch_models(api_key)
+    except Exception:
+        _live_ids = []
+_chat, _audio = split_models(_live_ids)
+_chat = _chat or FALLBACK_CHAT
+_audio = _audio or FALLBACK_AUDIO
+_first_llm = LLM_MODEL_OVERRIDE.strip() or _chat[0]
+_first_whisper = WHISPER_MODEL_OVERRIDE.strip() or _audio[0]
+llm_models = [_first_llm] + [m for m in _chat if m != _first_llm][:3]
+whisper_models = [_first_whisper] + [m for m in _audio if m != _first_whisper]
 language = LANGUAGES[lang_label]
 
 # ---------------------------------------------------------------------------
@@ -644,7 +716,7 @@ if go:
             data = uploaded.getvalue()
             if ext in AUDIO_EXT:
                 with st.spinner("Transcribing audio... longer recordings can take a minute."):
-                    source_text = transcribe_audio(client, name, data, whisper_model, language)
+                    source_text = transcribe_audio(client, name, data, whisper_models, language)
             elif ext in TEXT_EXT:
                 with st.spinner("Reading your document..."):
                     source_text = read_text_file(name, data)
@@ -658,7 +730,7 @@ if go:
         if len(source_text.split()) < 15:
             raise AppError("The text is too short to create minutes. Add more detail and try again.")
 
-        run_pipeline(client, llm_model, source_text, meeting_date_in)
+        run_pipeline(client, llm_models, source_text, meeting_date_in)
         st.success("Minutes are ready. Review and edit them below.")
     except Exception as exc:  # never show a raw traceback
         st.error(explain_error(exc))
@@ -730,7 +802,7 @@ else:
         if st.button("Regenerate minutes from this text"):
             try:
                 client = get_client(api_key)
-                run_pipeline(client, llm_model, edited_transcript, meeting_date_in)
+                run_pipeline(client, llm_models, edited_transcript, meeting_date_in)
                 st.rerun()
             except Exception as exc:
                 st.error(explain_error(exc))
